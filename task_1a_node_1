@@ -1,0 +1,206 @@
+/*
+ * Copyright (C) 2021 Otto-von-Guericke-Universität Magdeburg
+ *
+ * This file is subject to the terms and conditions of the GNU Lesser
+ * General Public License v2.1. See the file LICENSE in the top level
+ * directory for more details.
+ */
+
+/**
+ * @ingroup     examples
+ * @{
+ *
+ * @file
+ * @brief       Blinky application
+ *
+ * @author      Marian Buschsieweke <marian.buschsieweke@ovgu.de>
+ *
+ * @}
+ */
+
+#include <stdio.h>
+
+#include "board.h"
+#include "ztimer.h"
+#include "periph/gpio.h"
+
+
+#include "net/gnrc.h"
+#include "net/gnrc/netreg.h"
+#include "net/gnrc/ipv6.h"
+#include "net/gnrc/netif.h"
+#include "net/gnrc/netif/hdr.h"
+#include "net/gnrc/udp.h"
+
+#include "shell.h"
+
+
+#define PORT 8234
+#define DEST_ADDR "fe80::ec96:abd2:72af:8a00"
+#define MAIN_QUEUE_SIZE 1024
+
+
+
+
+
+static void count(uint32_t *counter){
+    puts(" ");
+    printf("This Counter: %ld\n", ++(*(counter)));
+}
+
+
+
+/* dest_addr required for transmission */
+static void parse_ipv6(ipv6_addr_t *dest_addr){
+
+    /* "DEST_ADDR" must be string, e.g., "fe80::1234:1234:1234:1234" */
+    if (ipv6_addr_from_str(dest_addr, DEST_ADDR) == NULL) {
+        puts("Error: unable to parse destination address");
+    }
+
+}
+
+
+
+
+/* NOTE: Errorhandling omitted for readability */
+static void send(ipv6_addr_t* addr, int port, uint32_t* data) {
+    // uint16_t data = 1456; /* example data */
+
+    /* gnrc_pktsnip_t: each snip is a different layer */
+    gnrc_pktsnip_t *payload, *udp, *ip;
+
+    /* allocate payload, udp-header, ip-header*/
+    payload = gnrc_pktbuf_add(NULL, data, sizeof(data), GNRC_NETTYPE_UNDEF);
+    udp = gnrc_udp_hdr_build(payload, port, port);
+    ip = gnrc_ipv6_hdr_build(udp, NULL, addr);
+
+    /* add netif header, set process-id of network interface*/
+    gnrc_pktsnip_t *netif = gnrc_netif_hdr_build(NULL, 0, NULL, 0);
+    ((gnrc_netif_hdr_t *)netif->data)->if_pid = (kernel_pid_t) gnrc_netif_iter(NULL)->pid;
+
+    /* prepend ip packet with netif header */
+    LL_PREPEND(ip, netif);
+
+    /* dispatch packet through network stack = send */
+    gnrc_netapi_dispatch_send(GNRC_NETTYPE_UDP, GNRC_NETREG_DEMUX_CTX_ALL, ip);
+}
+
+
+
+__attribute__((used))
+static void on_button_pressed(void* args){
+    uint32_t* counter = (uint32_t*) args;
+    count(counter);
+    ipv6_addr_t dest_addr;
+    parse_ipv6(&dest_addr);
+    send(&dest_addr, PORT, counter);
+    puts("Sent message\n");
+    LED0_TOGGLE;
+}
+
+
+
+
+
+
+
+static void _handle_incoming_pkt(gnrc_pktsnip_t* packet){
+    (void) packet;
+    puts("Received a message");
+    gnrc_pktsnip_t* payload_snip =
+    gnrc_pktsnip_search_type(packet,GNRC_NETTYPE_UNDEF);
+
+    /* output and free */
+    printf("Remote counter: %d\n",
+    *(uint16_t*)payload_snip->data);
+    gnrc_pktbuf_release(packet);
+    LED0_TOGGLE;
+}
+
+
+
+
+
+void* my_event_loop(void *arg)
+{
+    puts("2");
+    (void) arg;
+    static msg_t _msg_q[MAIN_QUEUE_SIZE];
+    puts("3");
+    msg_t msg, reply;
+    reply.type = GNRC_NETAPI_MSG_TYPE_ACK;
+    reply.content.value = -ENOTSUP;
+    msg_init_queue(_msg_q, MAIN_QUEUE_SIZE);
+    puts("4");
+    gnrc_pktsnip_t *pkt = NULL;
+    struct gnrc_netreg_entry me_reg = { .demux_ctx = PORT, .target.pid = thread_getpid() };
+    gnrc_netreg_register(GNRC_NETTYPE_UDP, &me_reg);
+    
+    puts("5");
+    while (1) {
+        msg_receive(&msg);
+        puts("6");
+        switch (msg.type) {
+            case GNRC_NETAPI_MSG_TYPE_RCV:
+                pkt = msg.content.ptr;
+                _handle_incoming_pkt(pkt);
+                break;
+            case GNRC_NETAPI_MSG_TYPE_SET:
+            case GNRC_NETAPI_MSG_TYPE_GET:
+                msg_reply(&msg, &reply);
+                break;
+            default:
+                break;
+        }
+        puts("7");
+    }
+ 
+    return NULL;
+}
+
+
+
+
+
+static char udp_thread_stack[512];
+
+__attribute__((used))
+static void start_receiving(void) {
+
+    puts("Starting the receiver");
+
+    puts("1");
+    
+    /* init receive thread */
+    thread_create(
+    udp_thread_stack, sizeof(udp_thread_stack),
+    THREAD_PRIORITY_MAIN - 1, THREAD_CREATE_STACKTEST,
+    my_event_loop, NULL, "udp loop");
+
+    puts("10");
+}
+
+
+
+
+
+
+
+int main(void)
+{
+
+    puts("Starting the application\n");
+
+    // start receiver on button press
+    static volatile uint32_t counter;
+    gpio_init_int(BTN0_PIN, BTN0_MODE, GPIO_FALLING, on_button_pressed, (void*) &counter);
+
+    // while(1);
+
+    start_receiving();
+    puts("Started the receiver\n");
+
+    char line_buf[SHELL_DEFAULT_BUFSIZE];
+    shell_run(NULL, line_buf, SHELL_DEFAULT_BUFSIZE);
+}
